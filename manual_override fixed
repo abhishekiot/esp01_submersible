@@ -1,0 +1,252 @@
+
+/**************************************************************
+ * FINAL SMART PUMP CONTROLLER (MANUAL OVERRIDE FIXED)
+ **************************************************************/
+
+#define BLYNK_USE_SSL false
+
+#define BLYNK_TEMPLATE_ID   "TMPL3rppW-ObG"
+#define BLYNK_TEMPLATE_NAME "google esp01 relay"
+#define BLYNK_AUTH_TOKEN    "9uN_lfqrxWS1Fo0A7ZiK3J4npHFIPq8f"
+
+/* ---------------- PINS ---------------- */
+#define RELAY_PIN     2
+#define ALARM_PIN     0
+#define PUMP_PIN      3
+#define OVERFLOW_PIN  1
+
+/* ---------------- VPINS ---------------- */
+#define VPIN_RELAY      V1
+#define VPIN_PUMP       V2
+#define VPIN_OVERFLOW   V3
+#define VPIN_OV_ENABLE  V4
+#define VPIN_DRY_ENABLE V5
+#define VPIN_DELAY      V6
+#define VPIN_OVERRIDE   V7
+#define VPIN_ALARM      V8
+
+#define AP_SSID "Pump_Controller"
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <EEPROM.h>
+#include <BlynkSimpleEsp8266.h>
+
+struct WiFiCred { char ssid[32]; char pass[32]; };
+
+WiFiCred activeCred;
+ESP8266WebServer server(80);
+BlynkTimer timer;
+
+/* ---------------- STATES ---------------- */
+bool apRunning = false;
+bool pumpState = false, lastPumpState = false;
+bool overflowDetected = false;
+bool relayState = false;
+bool runRequest = false;
+
+/* ---------------- SETTINGS ---------------- */
+bool overflowProtectionEnabled = 1;
+bool dryRunEnabled = 1;
+bool manualOverride = 0;
+
+unsigned long bootTime;
+unsigned long startupDelay = 5000;
+
+/* ---------------- TIMERS ---------------- */
+unsigned long overflowLowStart = 0;
+unsigned long pumpStartTime = 0;
+unsigned long lastStopTime = 0;
+
+#define OVERFLOW_STABLE_TIME 500
+#define DRY_RUN_TIME 5000
+#define MIN_ON_TIME 3000
+#define MIN_OFF_TIME 5000
+
+/* ---------------- WIFI ---------------- */
+void connectWiFi() {
+  WiFi.begin(activeCred.ssid, activeCred.pass);
+}
+
+void startAP() {
+  if (apRunning) return;
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID);
+
+  server.on("/", []() {
+    server.send(200, "text/html",
+      "<h3>WiFi Setup</h3><form action='/save'>"
+      "SSID:<input name='s'><br>Password:<input name='p'><br>"
+      "<input type='submit'></form>");
+  });
+
+  server.on("/save", []() {
+    strncpy(activeCred.ssid, server.arg("s").c_str(), 31);
+    strncpy(activeCred.pass, server.arg("p").c_str(), 31);
+    EEPROM.put(0, activeCred);
+    EEPROM.commit();
+    server.send(200, "text/html", "Saved. Restart device.");
+  });
+
+  server.begin();
+  apRunning = true;
+}
+
+void wifiTask() {
+  if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastAttempt = 0;
+
+    if (millis() - lastAttempt > 5000) {
+      lastAttempt = millis();
+      connectWiFi();
+    }
+    startAP();
+  } else {
+    if (apRunning) {
+      WiFi.softAPdisconnect(true);
+      apRunning = false;
+    }
+  }
+}
+
+/* ---------------- BLYNK ---------------- */
+BLYNK_WRITE(VPIN_RELAY) {
+  int state = param.asInt();
+
+  if (state == 1) {
+    runRequest = true;
+  } else {  
+    runRequest = false;
+  }
+}
+
+BLYNK_WRITE(VPIN_OV_ENABLE) { overflowProtectionEnabled = param.asInt(); }
+BLYNK_WRITE(VPIN_DRY_ENABLE) { dryRunEnabled = param.asInt(); }
+BLYNK_WRITE(VPIN_DELAY) { startupDelay = param.asInt(); }
+BLYNK_WRITE(VPIN_OVERRIDE) { manualOverride = param.asInt(); }
+
+BLYNK_WRITE(VPIN_ALARM) {
+  digitalWrite(ALARM_PIN, param.asInt() ? LOW : HIGH);
+}
+
+/* ---------------- PUMP FEEDBACK -------- */
+void checkPump() {
+  pumpState = (digitalRead(PUMP_PIN) == LOW);
+
+  // Only latch in AUTO mode
+  if (!manualOverride) {
+    if (pumpState && !lastPumpState) {
+      runRequest = true;
+    }
+  }
+
+  lastPumpState = pumpState;
+
+  Blynk.virtualWrite(VPIN_PUMP, pumpState);
+}
+
+/* ---------------- OVERFLOW ------------- */
+void checkOverflow() {
+
+  if (millis() - bootTime < startupDelay) return;
+
+  bool raw = (digitalRead(OVERFLOW_PIN) == LOW);
+
+  if (raw) {
+    if (overflowLowStart == 0) overflowLowStart = millis();
+
+    if (millis() - overflowLowStart > OVERFLOW_STABLE_TIME) {
+      overflowDetected = true;
+      Blynk.virtualWrite(VPIN_OVERFLOW, 1);
+
+      // Alarm ALWAYS works (even in manual override)
+      digitalWrite(ALARM_PIN, LOW);
+    }
+
+  } else {
+    overflowLowStart = 0;
+    overflowDetected = false;
+    Blynk.virtualWrite(VPIN_OVERFLOW, 0);
+  }
+}
+
+/* ---------------- CONTROL LOGIC -------- */
+void controlPump() {
+
+  // AUTO MODE protections
+  if (!manualOverride) {
+
+    if (overflowDetected && overflowProtectionEnabled) {
+      runRequest = false;
+    }
+
+    if (dryRunEnabled && relayState && !pumpState) {
+      if (millis() - pumpStartTime > DRY_RUN_TIME) {
+        runRequest = false;
+      }
+    }
+  }
+
+  // MIN OFF delay
+  if (!runRequest && millis() - lastStopTime < MIN_OFF_TIME) {
+    return;
+  }
+
+  // APPLY OUTPUT
+  if (runRequest) {
+
+    digitalWrite(RELAY_PIN, LOW);
+    relayState = true;
+
+    if (pumpStartTime == 0) pumpStartTime = millis();
+
+  } else {
+
+    if (relayState && millis() - pumpStartTime > MIN_ON_TIME) {
+      digitalWrite(RELAY_PIN, HIGH);
+      relayState = false;
+      lastStopTime = millis();
+      pumpStartTime = 0;
+    }
+  }
+}
+
+/* ---------------- SETUP ---------------- */
+void setup() {
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(ALARM_PIN, OUTPUT);
+  pinMode(PUMP_PIN, INPUT_PULLUP);
+  pinMode(OVERFLOW_PIN, INPUT_PULLUP);
+
+  digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(ALARM_PIN, HIGH);
+
+  EEPROM.begin(256);
+  EEPROM.get(0, activeCred);
+
+  bootTime = millis();
+
+  WiFi.mode(WIFI_AP_STA);
+
+  if (activeCred.ssid[0] == 0xFF || activeCred.ssid[0] == '\0') {
+    startAP();
+  } else {
+    connectWiFi();
+  }
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  timer.setInterval(300L, checkPump);
+  timer.setInterval(500L, checkOverflow);
+  timer.setInterval(300L, controlPump);
+  timer.setInterval(2000L, wifiTask);
+}
+
+/* ---------------- LOOP ---------------- */
+void loop() {
+  if (apRunning) server.handleClient();
+  if (WiFi.status() == WL_CONNECTED) Blynk.run();
+  timer.run();
+}
